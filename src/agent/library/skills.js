@@ -1075,6 +1075,7 @@ export async function goToGoal(bot, goal) {
      **/
 
     const nonDestructiveMovements = new pf.Movements(bot);
+    applyLearnedAvoidance(nonDestructiveMovements, bot);
     const dontBreakBlocks = ['glass', 'glass_pane'];
     for (let block of dontBreakBlocks) {
         nonDestructiveMovements.blocksCantBreak.add(mc.getBlockId(block));
@@ -1083,6 +1084,7 @@ export async function goToGoal(bot, goal) {
     nonDestructiveMovements.digCost = 10;
 
     const destructiveMovements = new pf.Movements(bot);
+    applyLearnedAvoidance(destructiveMovements, bot);
 
     let final_movements = destructiveMovements;
 
@@ -1098,18 +1100,31 @@ export async function goToGoal(bot, goal) {
         log(bot, `Path not found, but attempting to navigate anyway using destructive movements.`);
     }
 
-    const doorCheckInterval = startDoorInterval(bot);
-
-    bot.pathfinder.setMovements(final_movements);
-    try {
-        await bot.pathfinder.goto(goal);
-        clearInterval(doorCheckInterval);
-        return true;
-    } catch (err) {
-        clearInterval(doorCheckInterval);
-        // we need to catch so we can clean up the door check interval, then rethrow the error
-        throw err;
+    const maxAttempts = 3;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const doorCheckInterval = startDoorInterval(bot);
+        bot.pathfinder.setMovements(attempt === 1 ? final_movements : destructiveMovements);
+        const stuckMonitor = createStuckMonitor(bot, goal, () => recordPathFailure(bot));
+        try {
+            await bot.pathfinder.goto(goal);
+            stuckMonitor.stop();
+            clearInterval(doorCheckInterval);
+            return true;
+        } catch (err) {
+            stuckMonitor.stop();
+            clearInterval(doorCheckInterval);
+            lastError = err;
+            if (stuckMonitor.wasStuck) {
+                log(bot, `Pathfinding appears stuck. Attempting recovery (${attempt}/${maxAttempts}).`);
+            } else {
+                log(bot, `Pathfinding failed: ${err.message}. Retrying (${attempt}/${maxAttempts}).`);
+            }
+            await attemptRecoveryMove(bot);
+        }
     }
+    // we need to catch so we can clean up the door check interval, then rethrow the error
+    throw lastError ?? new Error('Pathfinding failed after multiple attempts.');
 }
 
 let _doorInterval = null;
@@ -1176,6 +1191,141 @@ function startDoorInterval(bot) {
     }, 200);
     _doorInterval = doorCheckInterval;
     return doorCheckInterval;
+}
+
+function createStuckMonitor(bot, goal, onStuck) {
+    const checkIntervalMs = 200;
+    const minMoveDistance = 0.15;
+    const stuckTimeoutMs = 2000;
+    const progressTimeoutMs = 3000;
+    let lastPos = bot.entity.position.clone();
+    let lastMoveAt = Date.now();
+    let lastProgressAt = Date.now();
+    let lastGoalDistance = getGoalDistance(goal);
+    let wasStuck = false;
+
+    const interval = setInterval(() => {
+        const now = Date.now();
+        const currentPos = bot.entity.position.clone();
+        if (currentPos.distanceTo(lastPos) >= minMoveDistance) {
+            lastMoveAt = now;
+            lastPos = currentPos;
+        }
+        const currentGoalDistance = getGoalDistance(goal);
+        if (currentGoalDistance !== null) {
+            if (lastGoalDistance === null || currentGoalDistance < lastGoalDistance - 0.2) {
+                lastProgressAt = now;
+                lastGoalDistance = currentGoalDistance;
+            }
+        }
+        if (now - lastMoveAt > stuckTimeoutMs || now - lastProgressAt > progressTimeoutMs) {
+            if (!wasStuck) {
+                wasStuck = true;
+                if (onStuck) {
+                    onStuck();
+                }
+            }
+            bot.pathfinder.stop();
+        }
+    }, checkIntervalMs);
+
+    return {
+        get wasStuck() {
+            return wasStuck;
+        },
+        stop() {
+            clearInterval(interval);
+        }
+    };
+
+    function getGoalDistance(currentGoal) {
+        if (!currentGoal) return null;
+        if (currentGoal.entity?.position) {
+            return currentGoal.entity.position.distanceTo(bot.entity.position);
+        }
+        if (currentGoal.x != null && currentGoal.y != null && currentGoal.z != null) {
+            return bot.entity.position.distanceTo(new Vec3(currentGoal.x, currentGoal.y, currentGoal.z));
+        }
+        return null;
+    }
+}
+
+async function attemptRecoveryMove(bot) {
+    bot.pathfinder.stop();
+    const recoveryTarget = world.getNearestFreeSpace(bot, 1, 4);
+    if (!recoveryTarget) {
+        return false;
+    }
+    const recoveryMovements = new pf.Movements(bot);
+    recoveryMovements.placeCost = 1;
+    bot.pathfinder.setMovements(recoveryMovements);
+    try {
+        await bot.pathfinder.goto(new pf.goals.GoalNear(recoveryTarget.x, recoveryTarget.y, recoveryTarget.z, 1));
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
+function applyLearnedAvoidance(movements, bot) {
+    const memory = getPathingMemory(bot);
+    movements.exclusionAreasStep.push((block) => {
+        if (!block || memory.failures.length === 0) return 0;
+        const now = Date.now();
+        let penalty = 0;
+        for (const failure of memory.failures) {
+            const ageMs = now - failure.lastSeen;
+            if (ageMs > memory.maxAgeMs) continue;
+            const distance = block.position.distanceTo(failure.position);
+            if (distance > memory.maxRadius) continue;
+            const decay = 1 - Math.min(ageMs / memory.maxAgeMs, 1);
+            penalty += (failure.weight * decay) * (memory.maxRadius - distance);
+        }
+        return Math.min(Math.round(penalty), memory.maxPenalty);
+    });
+}
+
+function recordPathFailure(bot) {
+    const memory = getPathingMemory(bot);
+    const position = bot.entity.position.clone();
+    let closest = null;
+    let closestDistance = Infinity;
+    for (const failure of memory.failures) {
+        const distance = failure.position.distanceTo(position);
+        if (distance < closestDistance) {
+            closest = failure;
+            closestDistance = distance;
+        }
+    }
+    if (closest && closestDistance <= memory.mergeRadius) {
+        closest.weight = Math.min(closest.weight + 1, memory.maxWeight);
+        closest.lastSeen = Date.now();
+        return;
+    }
+    memory.failures.push({
+        position,
+        weight: 1,
+        lastSeen: Date.now()
+    });
+    if (memory.failures.length > memory.maxEntries) {
+        memory.failures.sort((a, b) => a.lastSeen - b.lastSeen);
+        memory.failures.splice(0, memory.failures.length - memory.maxEntries);
+    }
+}
+
+function getPathingMemory(bot) {
+    if (!bot.pathingMemory) {
+        bot.pathingMemory = {
+            failures: [],
+            maxEntries: 30,
+            maxWeight: 5,
+            mergeRadius: 3,
+            maxRadius: 6,
+            maxPenalty: 50,
+            maxAgeMs: 10 * 60 * 1000
+        };
+    }
+    return bot.pathingMemory;
 }
 
 export async function goToPosition(bot, x, y, z, min_distance=2) {
