@@ -1,0 +1,9 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="mindcraft_pathhelper"
+version="1.0.0"
+displayName="Mindcraft Path Helper"
+description='''Provides lightweight commands to query surface height and nearby hazards for faster path decisions.'''
