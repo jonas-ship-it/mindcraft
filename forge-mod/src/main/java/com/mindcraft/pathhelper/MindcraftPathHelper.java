@@ -61,6 +61,9 @@ public class MindcraftPathHelper {
                         }
                     }
 
+                    final String message = "Hazards (r=" + radius + "): water=" + waterCount + ", lava=" + lavaCount;
+                    context.getSource().sendSuccess(
+                        () -> Component.literal(message),
                     context.getSource().sendSuccess(
                         () -> Component.literal("Hazards (r=" + radius + "): water=" + waterCount + ", lava=" + lavaCount),
                         false
