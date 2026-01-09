@@ -1076,7 +1076,6 @@ export async function goToGoal(bot, goal) {
 
     const nonDestructiveMovements = new pf.Movements(bot);
     applyLearnedAvoidance(nonDestructiveMovements, bot);
-    applyFlowingWaterAvoidance(nonDestructiveMovements);
     const dontBreakBlocks = ['glass', 'glass_pane'];
     for (let block of dontBreakBlocks) {
         nonDestructiveMovements.blocksCantBreak.add(mc.getBlockId(block));
@@ -1086,7 +1085,6 @@ export async function goToGoal(bot, goal) {
 
     const destructiveMovements = new pf.Movements(bot);
     applyLearnedAvoidance(destructiveMovements, bot);
-    applyFlowingWaterAvoidance(destructiveMovements);
 
     let final_movements = destructiveMovements;
 
@@ -1108,17 +1106,13 @@ export async function goToGoal(bot, goal) {
         const doorCheckInterval = startDoorInterval(bot);
         bot.pathfinder.setMovements(attempt === 1 ? final_movements : destructiveMovements);
         const stuckMonitor = createStuckMonitor(bot, goal, () => recordPathFailure(bot));
-        const swimAssist = startSwimAssist(bot);
         try {
             await bot.pathfinder.goto(goal);
             stuckMonitor.stop();
-            swimAssist.stop();
             clearInterval(doorCheckInterval);
-            recordPathSuccess(bot);
             return true;
         } catch (err) {
             stuckMonitor.stop();
-            swimAssist.stop();
             clearInterval(doorCheckInterval);
             lastError = err;
             if (stuckMonitor.wasStuck) {
@@ -1199,44 +1193,16 @@ function startDoorInterval(bot) {
     return doorCheckInterval;
 }
 
-function startSwimAssist(bot) {
-    let shouldJump = false;
-    const swimInterval = setInterval(() => {
-        const feetBlock = bot.blockAt(bot.entity.position);
-        const headBlock = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-        const inWater = feetBlock?.name === 'water' || headBlock?.name === 'water';
-        const headUnderwater = headBlock?.name === 'water';
-        const wantsJump = inWater && headUnderwater;
-        if (wantsJump !== shouldJump) {
-            shouldJump = wantsJump;
-            bot.setControlState('jump', shouldJump);
-        }
-    }, 200);
-    return {
-        stop() {
-            clearInterval(swimInterval);
-            if (shouldJump) {
-                bot.setControlState('jump', false);
-            }
-        }
-    };
-}
-
 function createStuckMonitor(bot, goal, onStuck) {
     const checkIntervalMs = 200;
     const minMoveDistance = 0.15;
     const stuckTimeoutMs = 2000;
     const progressTimeoutMs = 3000;
-    const loopTimeoutMs = 4000;
-    const loopRadius = 1.2;
-    const loopSampleSize = 20;
     let lastPos = bot.entity.position.clone();
     let lastMoveAt = Date.now();
     let lastProgressAt = Date.now();
-    let lastLoopCheckAt = Date.now();
     let lastGoalDistance = getGoalDistance(goal);
     let wasStuck = false;
-    const recentPositions = [];
 
     const interval = setInterval(() => {
         const now = Date.now();
@@ -1245,28 +1211,12 @@ function createStuckMonitor(bot, goal, onStuck) {
             lastMoveAt = now;
             lastPos = currentPos;
         }
-        recentPositions.push(currentPos);
-        if (recentPositions.length > loopSampleSize) {
-            recentPositions.shift();
-        }
         const currentGoalDistance = getGoalDistance(goal);
         if (currentGoalDistance !== null) {
             if (lastGoalDistance === null || currentGoalDistance < lastGoalDistance - 0.2) {
                 lastProgressAt = now;
                 lastGoalDistance = currentGoalDistance;
             }
-        }
-        if (!wasStuck && now - lastLoopCheckAt > loopTimeoutMs && recentPositions.length === loopSampleSize) {
-            const center = recentPositions[0];
-            const clustered = recentPositions.every((pos) => pos.distanceTo(center) <= loopRadius);
-            if (clustered && now - lastProgressAt > progressTimeoutMs) {
-                if (onStuck) {
-                    onStuck();
-                }
-                wasStuck = true;
-                bot.pathfinder.stop();
-            }
-            lastLoopCheckAt = now;
         }
         if (now - lastMoveAt > stuckTimeoutMs || now - lastProgressAt > progressTimeoutMs) {
             if (!wasStuck) {
@@ -1302,7 +1252,7 @@ function createStuckMonitor(bot, goal, onStuck) {
 
 async function attemptRecoveryMove(bot) {
     bot.pathfinder.stop();
-    const recoveryTarget = findNearestDrySpot(bot) ?? world.getNearestFreeSpace(bot, 1, 4);
+    const recoveryTarget = world.getNearestFreeSpace(bot, 1, 4);
     if (!recoveryTarget) {
         return false;
     }
@@ -1319,7 +1269,7 @@ async function attemptRecoveryMove(bot) {
 
 function applyLearnedAvoidance(movements, bot) {
     const memory = getPathingMemory(bot);
-    const penaltyForBlock = (block) => {
+    movements.exclusionAreasStep.push((block) => {
         if (!block || memory.failures.length === 0) return 0;
         const now = Date.now();
         let penalty = 0;
@@ -1332,21 +1282,7 @@ function applyLearnedAvoidance(movements, bot) {
             penalty += (failure.weight * decay) * (memory.maxRadius - distance);
         }
         return Math.min(Math.round(penalty), memory.maxPenalty);
-    };
-    movements.exclusionAreasStep.push(penaltyForBlock);
-    movements.exclusionAreasBreak.push(penaltyForBlock);
-    movements.exclusionAreasPlace.push(penaltyForBlock);
-}
-
-function applyFlowingWaterAvoidance(movements) {
-    const penaltyForFlowingWater = (block) => {
-        if (!block || block.name !== 'water') return 0;
-        if (block.metadata === 0) return 0;
-        return 60;
-    };
-    movements.exclusionAreasStep.push(penaltyForFlowingWater);
-    movements.exclusionAreasBreak.push(penaltyForFlowingWater);
-    movements.exclusionAreasPlace.push(penaltyForFlowingWater);
+    });
 }
 
 function recordPathFailure(bot) {
@@ -1377,24 +1313,6 @@ function recordPathFailure(bot) {
     }
 }
 
-function recordPathSuccess(bot) {
-    const memory = getPathingMemory(bot);
-    if (memory.failures.length === 0) return;
-    const position = bot.entity.position.clone();
-    const toRemove = [];
-    for (const failure of memory.failures) {
-        const distance = failure.position.distanceTo(position);
-        if (distance > memory.mergeRadius * 2) continue;
-        failure.weight -= 1;
-        if (failure.weight <= 0) {
-            toRemove.push(failure);
-        }
-    }
-    if (toRemove.length > 0) {
-        memory.failures = memory.failures.filter((failure) => !toRemove.includes(failure));
-    }
-}
-
 function getPathingMemory(bot) {
     if (!bot.pathingMemory) {
         bot.pathingMemory = {
@@ -1408,34 +1326,6 @@ function getPathingMemory(bot) {
         };
     }
     return bot.pathingMemory;
-}
-
-function findNearestDrySpot(bot) {
-    const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-    const feet = bot.blockAt(bot.entity.position);
-    const inWater = head?.name === 'water' || feet?.name === 'water';
-    if (!inWater) return null;
-    const candidates = bot.findBlocks({
-        matching: (block) => block && block.boundingBox === 'block' && block.name !== 'water' && block.name !== 'lava',
-        maxDistance: 6,
-        count: 30
-    });
-    let best = null;
-    let bestDistance = Infinity;
-    for (const position of candidates) {
-        const above = bot.blockAt(position.offset(0, 1, 0));
-        const aboveTwo = bot.blockAt(position.offset(0, 2, 0));
-        if (!above || !aboveTwo) continue;
-        const isAir = (block) => block.name === 'air' || block.name === 'cave_air';
-        if (!isAir(above) || !isAir(aboveTwo)) continue;
-        const target = position.offset(0, 1, 0);
-        const distance = target.distanceTo(bot.entity.position);
-        if (distance < bestDistance) {
-            best = target;
-            bestDistance = distance;
-        }
-    }
-    return best;
 }
 
 export async function goToPosition(bot, x, y, z, min_distance=2) {
