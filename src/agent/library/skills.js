@@ -1209,6 +1209,13 @@ export async function goToGoal(bot, goal) {
         } catch (err) {
             stuckMonitor.stop();
             swimAssist.stop();
+        try {
+            await bot.pathfinder.goto(goal);
+            stuckMonitor.stop();
+            clearInterval(doorCheckInterval);
+            return true;
+        } catch (err) {
+            stuckMonitor.stop();
             clearInterval(doorCheckInterval);
             lastError = err;
             if (stuckMonitor.wasStuck) {
@@ -1327,6 +1334,11 @@ function createStuckMonitor(bot, goal, onStuck) {
     let lastGoalDistance = getGoalDistance(goal);
     let wasStuck = false;
     const recentPositions = [];
+    let lastPos = bot.entity.position.clone();
+    let lastMoveAt = Date.now();
+    let lastProgressAt = Date.now();
+    let lastGoalDistance = getGoalDistance(goal);
+    let wasStuck = false;
 
     const interval = setInterval(() => {
         const now = Date.now();
@@ -1409,6 +1421,7 @@ async function attemptRecoveryMove(bot) {
 
 async function attemptDryEscape(bot) {
     const recoveryTarget = findNearestDrySpot(bot);
+    const recoveryTarget = world.getNearestFreeSpace(bot, 1, 4);
     if (!recoveryTarget) {
         return false;
     }
@@ -1426,6 +1439,7 @@ async function attemptDryEscape(bot) {
 function applyLearnedAvoidance(movements, bot) {
     const memory = getPathingMemory(bot);
     const penaltyForBlock = (block) => {
+    movements.exclusionAreasStep.push((block) => {
         if (!block || memory.failures.length === 0) return 0;
         const now = Date.now();
         let penalty = 0;
@@ -1453,6 +1467,7 @@ function applyFlowingWaterAvoidance(movements) {
     movements.exclusionAreasStep.push(penaltyForFlowingWater);
     movements.exclusionAreasBreak.push(penaltyForFlowingWater);
     movements.exclusionAreasPlace.push(penaltyForFlowingWater);
+    });
 }
 
 function recordPathFailure(bot) {
